@@ -27,11 +27,15 @@ document.getElementById('scrapeForm').addEventListener('submit', async function 
             body: JSON.stringify({ website_url: websiteUrl, max_pages: maxPages })
         });
         
+        // Read response body as text first
+        const responseText = await response.text();
         let data;
+
+        // Try to parse as JSON
         try {
-            data = await response.json();
+            data = JSON.parse(responseText);
         } catch (e) {
-            throw new Error(`Server returned invalid JSON: ${await response.text()}`);
+            throw new Error(`Server returned invalid JSON: ${responseText}`);
         }
 
         // Update progress based on stage
