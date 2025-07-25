@@ -1,17 +1,18 @@
 import os
-import zipfile
 import requests
+from bs4 import BeautifulSoup
+import html2text
 import boto3
 import shutil
 from flask import Flask, render_template, request, jsonify
 from botocore.client import Config
 from botocore.exceptions import ClientError
 from werkzeug.utils import secure_filename
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import re
 import tempfile
 import logging
-import time
+from collections import deque
 
 app = Flask(__name__)
 
@@ -44,151 +45,148 @@ except Exception as e:
     logger.error(f"Failed to initialize R2 client: {str(e)}")
     s3_client = None
 
-# Validate GitHub URL
-def is_valid_github_url(url):
-    pattern = r'^https://github\.com/[\w-]+/[\w-]+/?$'
+# Validate URL
+def is_valid_url(url):
+    pattern = r'^https?://[\w-]+(\.[\w-]+)+[/\w-]*$'
     return bool(re.match(pattern, url))
 
-# Check if GitHub repo exists and is accessible
-def check_repo_exists(owner, repo):
-    api_url = f"https://api.github.com/repos/{owner}/{repo}"
-    try:
-        response = requests.get(api_url, timeout=10)
-        if response.status_code == 200:
-            return True, None
-        elif response.status_code == 404:
-            return False, "Repository not found or is private"
-        else:
-            return False, f"GitHub API error: HTTP {response.status_code}"
-    except requests.RequestException as e:
-        return False, f"Failed to check repository: {str(e)}"
+# Normalize URL to ensure consistency
+def normalize_url(url, base_url):
+    parsed_base = urlparse(base_url)
+    absolute_url = urljoin(base_url, url.strip())
+    parsed_absolute = urlparse(absolute_url)
+    if parsed_absolute.netloc == parsed_base.netloc:
+        return absolute_url
+    return None
 
-# Extract owner and repo from GitHub URL
-def parse_github_url(url):
-    parsed_url = urlparse(url)
-    path_parts = parsed_url.path.strip('/').split('/')
-    if len(path_parts) >= 2:
-        return path_parts[0], path_parts[1]
-    return None, None
+# Crawl website and extract HTML
+def crawl_website(start_url, max_pages=100):
+    visited = set()
+    to_visit = deque([(start_url, 0)])
+    html_pages = []
+    base_domain = urlparse(start_url).netloc
 
-# Download and unzip GitHub repo
-def download_and_unzip_repo(url, temp_dir):
-    owner, repo = parse_github_url(url)
-    if not owner or not repo:
-        return None, "Invalid GitHub repository URL"
+    while to_visit and len(html_pages) < max_pages:
+        url, depth = to_visit.popleft()
+        if url in visited:
+            continue
 
-    # Check if repo exists
-    exists, error = check_repo_exists(owner, repo)
-    if not exists:
-        return None, error
-
-    zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/main.zip"
-    try:
-        response = requests.get(zip_url, stream=True, timeout=30)
-        if response.status_code != 200:
-            return None, f"Failed to download repository: HTTP {response.status_code}"
-
-        zip_path = os.path.join(temp_dir, 'repo.zip')
-        with open(zip_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-
-        # Unzip the file
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
-        
-        # Find the extracted folder (usually <repo>-main)
-        extracted_folder = os.path.join(temp_dir, f"{repo}-main")
-        if not os.path.exists(extracted_folder):
-            return None, "Extracted folder not found"
-        
-        # Explicitly remove zip file after extraction
+        visited.add(url)
         try:
-            os.remove(zip_path)
-            logger.info(f"Deleted temporary zip file: {zip_path}")
-        except Exception as e:
-            logger.error(f"Failed to delete zip file {zip_path}: {str(e)}")
-        
-        return extracted_folder, None
-    except requests.RequestException as e:
-        return None, f"Download error: {str(e)}"
-    except zipfile.BadZipFile:
-        return None, "Invalid or corrupted zip file"
-    except Exception as e:
-        return None, f"Error downloading/unzipping repo: {str(e)}"
+            response = requests.get(url, timeout=10)
+            if response.status_code != 200:
+                logger.warning(f"Failed to fetch {url}: HTTP {response.status_code}")
+                continue
 
-# Upload files to R2 and clean up
-def upload_files_to_r2(folder_path, bucket_name, temp_dir):
+            soup = BeautifulSoup(response.text, 'html.parser')
+            html_pages.append({"url": url, "html": response.text})
+
+            # Extract links
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                normalized_href = normalize_url(href, start_url)
+                if normalized_href and normalized_href not in visited and len(visited) < max_pages:
+                    to_visit.append((normalized_href, depth + 1))
+
+            logger.info(f"Crawled {url} (Depth: {depth}, Total: {len(html_pages)})")
+        except requests.RequestException as e:
+            logger.error(f"Error crawling {url}: {str(e)}")
+            continue
+
+    return html_pages, None if html_pages else "No pages crawled successfully"
+
+# Convert HTML to Markdown and save to temp files
+def convert_to_markdown(html_pages, temp_dir):
+    h = html2text.HTML2Text()
+    h.body_width = 0  # Disable line wrapping
+    markdown_files = []
+
+    for page in html_pages:
+        url = page['url']
+        html_content = page['html']
+        try:
+            markdown = h.handle(html_content)
+            filename = secure_filename(urlparse(url).path.lstrip('/') or 'index') + '.md'
+            file_path = os.path.join(temp_dir, filename)
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(markdown)
+            markdown_files.append({"url": url, "file_path": file_path, "filename": filename})
+        except Exception as e:
+            logger.error(f"Error converting {url} to Markdown: {str(e)}")
+            continue
+
+    return markdown_files, None if markdown_files else "No pages converted to Markdown"
+
+# Upload Markdown files to R2
+def upload_files_to_r2(markdown_files, bucket_name, temp_dir):
     if not s3_client:
         return None, "R2 client not initialized. Check credentials."
     
     uploaded_files = []
     try:
-        for root, _, files in os.walk(folder_path):
-            for file_name in files:
-                file_path = os.path.join(root, file_name)
-                # Create R2 key (relative path from extracted folder)
-                relative_path = os.path.relpath(file_path, folder_path)
-                r2_key = secure_filename(relative_path.replace(os.sep, '/'))
-                
-                try:
-                    with open(file_path, 'rb') as file_data:
-                        s3_client.upload_fileobj(
-                            file_data,
-                            bucket_name,
-                            r2_key,
-                            ExtraArgs={
-                                "ACL": "public-read",
-                                "ContentType": "application/octet-stream"
-                            }
-                        )
-                    uploaded_files.append(r2_key)
-                except ClientError as e:
-                    return None, f"Failed to upload {file_name}: {str(e)}"
-        return uploaded_files, None
+        for file_info in markdown_files:
+            file_path = file_info['file_path']
+            filename = file_info['filename']
+            try:
+                with open(file_path, 'rb') as file_data:
+                    s3_client.upload_fileobj(
+                        file_data,
+                        bucket_name,
+                        filename,
+                        ExtraArgs={
+                            "ACL": "public-read",
+                            "ContentType": "text/markdown"
+                        }
+                    )
+                uploaded_files.append(filename)
+                logger.info(f"Uploaded {filename} to R2")
+            except ClientError as e:
+                return None, f"Failed to upload {filename}: {str(e)}"
     except Exception as e:
         return None, f"Error accessing files: {str(e)}"
     finally:
-        # Clean up extracted folder
+        # Clean up temporary directory
         try:
-            shutil.rmtree(folder_path, ignore_errors=True)
-            logger.info(f"Deleted temporary folder: {folder_path}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            logger.info(f"Deleted temporary directory: {temp_dir}")
         except Exception as e:
-            logger.error(f"Failed to delete folder {folder_path}: {str(e)}")
-        # Verify temp_dir is empty
-        try:
-            if os.path.exists(temp_dir) and not os.listdir(temp_dir):
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                logger.info(f"Deleted empty temporary directory: {temp_dir}")
-        except Exception as e:
-            logger.error(f"Failed to verify/delete temp directory {temp_dir}: {str(e)}")
+            logger.error(f"Failed to delete temp directory {temp_dir}: {str(e)}")
+
+    return uploaded_files, None if uploaded_files else "No files uploaded"
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
-@app.route('/upload', methods=['POST'])
-def upload_repo():
+@app.route('/scrape', methods=['POST'])
+def scrape_website():
     data = request.get_json()
-    repo_url = data.get('repo_url', '').strip()
+    website_url = data.get('website_url', '').strip()
+    max_pages = int(data.get('max_pages', 100))
 
-    if not is_valid_github_url(repo_url):
-        return jsonify({"error": "Invalid GitHub URL. Must be in the format https://github.com/owner/repo"}), 400
+    if not is_valid_url(website_url):
+        return jsonify({"error": "Invalid URL. Must be in the format http(s)://domain.com", "stage": "validation"}), 400
 
     # Create temporary directory
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Stage 1: Download and unzip repo
-        extracted_folder, error = download_and_unzip_repo(repo_url, temp_dir)
+        # Stage 1: Crawl website
+        html_pages, error = crawl_website(website_url, max_pages)
         if error:
-            return jsonify({"error": error, "stage": "download"}), 500
+            return jsonify({"error": error, "stage": "crawl"}), 500
 
-        # Stage 2: Upload files to R2 and clean up
-        uploaded_files, error = upload_files_to_r2(extracted_folder, R2_BUCKET_NAME, temp_dir)
+        # Stage 2: Convert HTML to Markdown
+        markdown_files, error = convert_to_markdown(html_pages, temp_dir)
+        if error:
+            return jsonify({"error": error, "stage": "convert"}), 500
+
+        # Stage 3: Upload files to R2
+        uploaded_files, error = upload_files_to_r2(markdown_files, R2_BUCKET_NAME, temp_dir)
         if error:
             return jsonify({"error": error, "stage": "upload"}), 500
 
         return jsonify({
-            "message": f"Successfully uploaded {len(uploaded_files)} files to Cloudflare R2",
+            "message": f"Successfully uploaded {len(uploaded_files)} Markdown files to Cloudflare R2",
             "files": uploaded_files,
             "stage": "complete"
         }), 200
