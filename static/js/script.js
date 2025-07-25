@@ -1,27 +1,30 @@
-document.getElementById('uploadForm').addEventListener('submit', async function (e) {
+document.getElementById('scrapeForm').addEventListener('submit', async function (e) {
     e.preventDefault();
     
-    const repoUrl = document.getElementById('repoUrl').value;
+    const websiteUrl = document.getElementById('websiteUrl').value;
+    const maxPages = document.getElementById('maxPages').value;
     const loading = document.getElementById('loading');
     const result = document.getElementById('result');
     const progressSection = document.getElementById('progressSection');
     const progressBar = document.getElementById('progressBar');
     const progressMessage = document.getElementById('progressMessage');
+    const pagesProcessed = document.getElementById('pagesProcessed');
     
     // Reset UI
     result.innerHTML = '';
     progressSection.classList.add('d-none');
     loading.classList.remove('d-none');
     progressBar.style.width = '0%';
-    progressMessage.textContent = 'Starting upload process...';
+    progressMessage.textContent = 'Starting scraping process...';
+    pagesProcessed.textContent = '';
 
     try {
-        const response = await fetch('/upload', {
+        const response = await fetch('/scrape', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ repo_url: repoUrl })
+            body: JSON.stringify({ website_url: websiteUrl, max_pages: maxPages })
         });
         
         let data;
@@ -32,18 +35,22 @@ document.getElementById('uploadForm').addEventListener('submit', async function 
         }
 
         // Update progress based on stage
-        if (data.stage === 'download') {
-            progressSection.classList.remove('d-none');
+        progressSection.classList.remove('d-none');
+        if (data.stage === 'validation') {
+            progressBar.style.width = '0%';
+            progressMessage.textContent = 'Validating URL...';
+        } else if (data.stage === 'crawl') {
             progressBar.style.width = '33%';
-            progressMessage.textContent = 'Downloading repository...';
-        } else if (data.stage === 'upload') {
-            progressSection.classList.remove('d-none');
+            progressMessage.textContent = 'Crawling website...';
+        } else if (data.stage === 'convert') {
             progressBar.style.width = '66%';
+            progressMessage.textContent = 'Converting HTML to Markdown...';
+        } else if (data.stage === 'upload') {
+            progressBar.style.width = '90%';
             progressMessage.textContent = 'Uploading files to Cloudflare R2...';
         } else if (data.stage === 'complete') {
-            progressSection.classList.remove('d-none');
             progressBar.style.width = '100%';
-            progressMessage.textContent = 'Upload complete!';
+            progressMessage.textContent = 'Scraping and upload complete!';
         }
 
         if (response.ok) {
