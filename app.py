@@ -5,11 +5,13 @@ import boto3
 import shutil
 from flask import Flask, render_template, request, jsonify
 from botocore.client import Config
+from botocore.exceptions import ClientError
 from werkzeug.utils import secure_filename
 from urllib.parse import urlparse
 import re
 import tempfile
 import logging
+import time
 
 app = Flask(__name__)
 
@@ -26,22 +28,40 @@ R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
-R2_ENDPOINT_URL = f"https://c633744eb31adb64ca1dc2ad9e89a645.r2.cloudflarestorage.com"
+R2_ENDPOINT_URL = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else None
 
 # Initialize S3 client for Cloudflare R2
-s3_client = boto3.client(
-    's3',
-    endpoint_url=R2_ENDPOINT_URL,
-    aws_access_key_id=R2_ACCESS_KEY,
-    aws_secret_access_key=R2_SECRET_KEY,
-    config=Config(signature_version='s3v4'),
-    region_name='auto'
-)
+try:
+    s3_client = boto3.client(
+        's3',
+        endpoint_url=R2_ENDPOINT_URL,
+        aws_access_key_id=R2_ACCESS_KEY,
+        aws_secret_access_key=R2_SECRET_KEY,
+        config=Config(signature_version='s3v4'),
+        region_name='auto'
+    )
+except Exception as e:
+    logger.error(f"Failed to initialize R2 client: {str(e)}")
+    s3_client = None
 
 # Validate GitHub URL
 def is_valid_github_url(url):
     pattern = r'^https://github\.com/[\w-]+/[\w-]+/?$'
     return bool(re.match(pattern, url))
+
+# Check if GitHub repo exists and is accessible
+def check_repo_exists(owner, repo):
+    api_url = f"https://api.github.com/repos/{owner}/{repo}"
+    try:
+        response = requests.get(api_url, timeout=10)
+        if response.status_code == 200:
+            return True, None
+        elif response.status_code == 404:
+            return False, "Repository not found or is private"
+        else:
+            return False, f"GitHub API error: HTTP {response.status_code}"
+    except requests.RequestException as e:
+        return False, f"Failed to check repository: {str(e)}"
 
 # Extract owner and repo from GitHub URL
 def parse_github_url(url):
@@ -57,9 +77,14 @@ def download_and_unzip_repo(url, temp_dir):
     if not owner or not repo:
         return None, "Invalid GitHub repository URL"
 
+    # Check if repo exists
+    exists, error = check_repo_exists(owner, repo)
+    if not exists:
+        return None, error
+
     zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/main.zip"
     try:
-        response = requests.get(zip_url, stream=True)
+        response = requests.get(zip_url, stream=True, timeout=30)
         if response.status_code != 200:
             return None, f"Failed to download repository: HTTP {response.status_code}"
 
@@ -85,11 +110,18 @@ def download_and_unzip_repo(url, temp_dir):
             logger.error(f"Failed to delete zip file {zip_path}: {str(e)}")
         
         return extracted_folder, None
+    except requests.RequestException as e:
+        return None, f"Download error: {str(e)}"
+    except zipfile.BadZipFile:
+        return None, "Invalid or corrupted zip file"
     except Exception as e:
         return None, f"Error downloading/unzipping repo: {str(e)}"
 
 # Upload files to R2 and clean up
 def upload_files_to_r2(folder_path, bucket_name, temp_dir):
+    if not s3_client:
+        return None, "R2 client not initialized. Check credentials."
+    
     uploaded_files = []
     try:
         for root, _, files in os.walk(folder_path):
@@ -111,7 +143,7 @@ def upload_files_to_r2(folder_path, bucket_name, temp_dir):
                             }
                         )
                     uploaded_files.append(r2_key)
-                except Exception as e:
+                except ClientError as e:
                     return None, f"Failed to upload {file_name}: {str(e)}"
         return uploaded_files, None
     except Exception as e:
@@ -145,19 +177,20 @@ def upload_repo():
 
     # Create temporary directory
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Download and unzip repo
+        # Stage 1: Download and unzip repo
         extracted_folder, error = download_and_unzip_repo(repo_url, temp_dir)
         if error:
-            return jsonify({"error": error}), 500
+            return jsonify({"error": error, "stage": "download"}), 500
 
-        # Upload files to R2 and clean up
+        # Stage 2: Upload files to R2 and clean up
         uploaded_files, error = upload_files_to_r2(extracted_folder, R2_BUCKET_NAME, temp_dir)
         if error:
-            return jsonify({"error": error}), 500
+            return jsonify({"error": error, "stage": "upload"}), 500
 
         return jsonify({
             "message": f"Successfully uploaded {len(uploaded_files)} files to Cloudflare R2",
-            "files": uploaded_files
+            "files": uploaded_files,
+            "stage": "complete"
         }), 200
 
 if __name__ == '__main__':
