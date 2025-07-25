@@ -9,8 +9,13 @@ from werkzeug.utils import secure_filename
 from urllib.parse import urlparse
 import re
 import tempfile
+import logging
 
 app = Flask(__name__)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -21,7 +26,7 @@ R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
-R2_ENDPOINT_URL = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+R2_ENDPOINT_URL = f"https://c633744eb31adb64ca1dc2ad9e89a645.r2.cloudflarestorage.com"
 
 # Initialize S3 client for Cloudflare R2
 s3_client = boto3.client(
@@ -72,12 +77,19 @@ def download_and_unzip_repo(url, temp_dir):
         if not os.path.exists(extracted_folder):
             return None, "Extracted folder not found"
         
+        # Explicitly remove zip file after extraction
+        try:
+            os.remove(zip_path)
+            logger.info(f"Deleted temporary zip file: {zip_path}")
+        except Exception as e:
+            logger.error(f"Failed to delete zip file {zip_path}: {str(e)}")
+        
         return extracted_folder, None
     except Exception as e:
         return None, f"Error downloading/unzipping repo: {str(e)}"
 
-# Upload files to R2
-def upload_files_to_r2(folder_path, bucket_name):
+# Upload files to R2 and clean up
+def upload_files_to_r2(folder_path, bucket_name, temp_dir):
     uploaded_files = []
     try:
         for root, _, files in os.walk(folder_path):
@@ -104,6 +116,20 @@ def upload_files_to_r2(folder_path, bucket_name):
         return uploaded_files, None
     except Exception as e:
         return None, f"Error accessing files: {str(e)}"
+    finally:
+        # Clean up extracted folder
+        try:
+            shutil.rmtree(folder_path, ignore_errors=True)
+            logger.info(f"Deleted temporary folder: {folder_path}")
+        except Exception as e:
+            logger.error(f"Failed to delete folder {folder_path}: {str(e)}")
+        # Verify temp_dir is empty
+        try:
+            if os.path.exists(temp_dir) and not os.listdir(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                logger.info(f"Deleted empty temporary directory: {temp_dir}")
+        except Exception as e:
+            logger.error(f"Failed to verify/delete temp directory {temp_dir}: {str(e)}")
 
 @app.route('/')
 def index():
@@ -124,8 +150,8 @@ def upload_repo():
         if error:
             return jsonify({"error": error}), 500
 
-        # Upload files to R2
-        uploaded_files, error = upload_files_to_r2(extracted_folder, R2_BUCKET_NAME)
+        # Upload files to R2 and clean up
+        uploaded_files, error = upload_files_to_r2(extracted_folder, R2_BUCKET_NAME, temp_dir)
         if error:
             return jsonify({"error": error}), 500
 
