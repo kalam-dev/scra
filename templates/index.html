@@ -3,26 +3,31 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GitHub to Cloudflare R2 Uploader</title>
+    <title>Website to Cloudflare R2 Scraper</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
     <div class="container mt-5">
-        <h1 class="text-center mb-4">GitHub to Cloudflare R2 Uploader</h1>
+        <h1 class="text-center mb-4">Website to Cloudflare R2 Scraper</h1>
         <div class="card p-4 shadow">
-            <form id="uploadForm">
+            <form id="scrapeForm">
                 <div class="mb-3">
-                    <label for="repoUrl" class="form-label">GitHub Repository URL</label>
-                    <input type="text" class="form-control" id="repoUrl" placeholder="https://github.com/owner/repo" required>
+                    <label for="websiteUrl" class="form-label">Website URL</label>
+                    <input type="text" class="form-control" id="websiteUrl" placeholder="https://example.com" required>
                 </div>
-                <button type="submit" class="btn btn-primary w-100">Upload to R2</button>
+                <div class="mb-3">
+                    <label for="maxPages" class="form-label">Maximum Pages to Crawl (1-1000)</label>
+                    <input type="number" class="form-control" id="maxPages" min="1" max="1000" value="100" required>
+                </div>
+                <button type="submit" class="btn btn-primary w-100">Scrape and Upload to R2</button>
             </form>
             <div id="progressSection" class="mt-3 d-none">
                 <div class="progress">
                     <div id="progressBar" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width: 0%"></div>
                 </div>
                 <p id="progressMessage" class="text-center mt-2"></p>
+                <p id="pagesProcessed" class="text-center mt-2"></p>
             </div>
             <div id="loading" class="loading-spinner d-none">
                 <div class="spinner"></div>
